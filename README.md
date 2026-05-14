@@ -1,8 +1,8 @@
 # AI Interview Platform
 
 > Production-style microservices backend for conducting technical interviews with AI-powered code evaluation.
+built with FastAPI, RabbitMQ, Redis, Celery and Docker microservices architecture.
 
-[![CI](https://github.com/yourusername/ai-interview-platform/actions/workflows/ci.yml/badge.svg)](https://github.com/yourusername/ai-interview-platform/actions)
 ![Python](https://img.shields.io/badge/Python-3.11-blue?logo=python)
 ![FastAPI](https://img.shields.io/badge/FastAPI-0.111-green?logo=fastapi)
 ![PostgreSQL](https://img.shields.io/badge/PostgreSQL-15-blue?logo=postgresql)
