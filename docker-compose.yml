@@ -1,0 +1,237 @@
+# ============================================================
+# AI Interview Platform — Production-style Docker Compose
+# ============================================================
+# Services:
+#   Infrastructure: postgres_auth, postgres_assessment, postgres_ai,
+#                   redis, rabbitmq
+#   App:            auth, assessment, ai_worker, notification
+# ============================================================
+
+x-postgres-healthcheck: &postgres-healthcheck
+  healthcheck:
+    test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+    interval: 10s
+    timeout: 5s
+    retries: 5
+    start_period: 10s
+
+x-service-defaults: &service-defaults
+  restart: unless-stopped
+  networks:
+    - backend
+
+services:
+
+  # ----------------------------------------------------------
+  # INFRASTRUCTURE
+  # ----------------------------------------------------------
+
+  postgres_auth:
+    image: postgres:15-alpine
+    <<: [*service-defaults, *postgres-healthcheck]
+    environment:
+      POSTGRES_USER: ${AUTH_DB_USER:-auth_user}
+      POSTGRES_PASSWORD: ${AUTH_DB_PASSWORD:-auth_pass}
+      POSTGRES_DB: ${AUTH_DB_NAME:-auth_db}
+    volumes:
+      - postgres_auth_data:/var/lib/postgresql/data
+    ports:
+      - "5433:5432"
+
+  postgres_assessment:
+    image: postgres:15-alpine
+    <<: [*service-defaults, *postgres-healthcheck]
+    environment:
+      POSTGRES_USER: ${ASSESSMENT_DB_USER:-assessment_user}
+      POSTGRES_PASSWORD: ${ASSESSMENT_DB_PASSWORD:-assessment_pass}
+      POSTGRES_DB: ${ASSESSMENT_DB_NAME:-assessment_db}
+    volumes:
+      - postgres_assessment_data:/var/lib/postgresql/data
+    ports:
+      - "5434:5432"
+
+  postgres_ai:
+    image: postgres:15-alpine
+    <<: [*service-defaults, *postgres-healthcheck]
+    environment:
+      POSTGRES_USER: ${AI_DB_USER:-ai_user}
+      POSTGRES_PASSWORD: ${AI_DB_PASSWORD:-ai_pass}
+      POSTGRES_DB: ${AI_DB_NAME:-ai_db}
+    volumes:
+      - postgres_ai_data:/var/lib/postgresql/data
+    ports:
+      - "5435:5432"
+
+  redis:
+    image: redis:7-alpine
+    <<: *service-defaults
+    command: redis-server --requirepass ${REDIS_PASSWORD:-redis_pass} --appendonly yes
+    volumes:
+      - redis_data:/data
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD:-redis_pass}", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  rabbitmq:
+    image: rabbitmq:3.12-management-alpine
+    <<: *service-defaults
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-rmq_user}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:-rmq_pass}
+      RABBITMQ_DEFAULT_VHOST: ${RABBITMQ_VHOST:-interview_vhost}
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    ports:
+      - "5672:5672"
+      - "15672:15672"   # Management UI: http://localhost:15672
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "ping"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 20s
+
+  # ----------------------------------------------------------
+  # APPLICATION SERVICES
+  # ----------------------------------------------------------
+
+  auth:
+    build:
+      context: ./services/auth
+      dockerfile: Dockerfile
+    <<: *service-defaults
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${AUTH_DB_USER:-auth_user}:${AUTH_DB_PASSWORD:-auth_pass}@postgres_auth:5432/${AUTH_DB_NAME:-auth_db}
+      REDIS_URL: redis://:${REDIS_PASSWORD:-redis_pass}@redis:6379/0
+    ports:
+      - "8001:8000"
+    depends_on:
+      postgres_auth:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./services/auth:/app   # hot reload in dev
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+
+  assessment:
+    build:
+      context: ./services/assessment
+      dockerfile: Dockerfile
+    <<: *service-defaults
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${ASSESSMENT_DB_USER:-assessment_user}:${ASSESSMENT_DB_PASSWORD:-assessment_pass}@postgres_assessment:5432/${ASSESSMENT_DB_NAME:-assessment_db}
+      REDIS_URL: redis://:${REDIS_PASSWORD:-redis_pass}@redis:6379/1
+      RABBITMQ_URL: amqp://${RABBITMQ_USER:-rmq_user}:${RABBITMQ_PASSWORD:-rmq_pass}@rabbitmq:5672/${RABBITMQ_VHOST:-interview_vhost}
+      AUTH_SERVICE_URL: http://auth:8000
+    ports:
+      - "8002:8000"
+    depends_on:
+      postgres_assessment:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      auth:
+        condition: service_healthy
+    volumes:
+      - ./services/assessment:/app
+
+  ai_worker:
+    build:
+      context: ./services/ai_worker
+      dockerfile: Dockerfile
+    <<: *service-defaults
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${AI_DB_USER:-ai_user}:${AI_DB_PASSWORD:-ai_pass}@postgres_ai:5432/${AI_DB_NAME:-ai_db}
+      REDIS_URL: redis://:${REDIS_PASSWORD:-redis_pass}@redis:6379/2
+      RABBITMQ_URL: amqp://${RABBITMQ_USER:-rmq_user}:${RABBITMQ_PASSWORD:-rmq_pass}@rabbitmq:5672/${RABBITMQ_VHOST:-interview_vhost}
+      CELERY_BROKER_URL: amqp://${RABBITMQ_USER:-rmq_user}:${RABBITMQ_PASSWORD:-rmq_pass}@rabbitmq:5672/${RABBITMQ_VHOST:-interview_vhost}
+      CELERY_RESULT_BACKEND: redis://:${REDIS_PASSWORD:-redis_pass}@redis:6379/3
+    depends_on:
+      postgres_ai:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    volumes:
+      - ./services/ai_worker:/app
+    # Celery worker command — не FastAPI
+    command: celery -A app.worker worker --loglevel=info --concurrency=4 -Q assessment.evaluate,assessment.feedback
+
+  notification:
+    build:
+      context: ./services/notification
+      dockerfile: Dockerfile
+    <<: *service-defaults
+    env_file: .env
+    environment:
+      REDIS_URL: redis://:${REDIS_PASSWORD:-redis_pass}@redis:6379/4
+      RABBITMQ_URL: amqp://${RABBITMQ_USER:-rmq_user}:${RABBITMQ_PASSWORD:-rmq_pass}@rabbitmq:5672/${RABBITMQ_VHOST:-interview_vhost}
+    ports:
+      - "8003:8000"
+    depends_on:
+      redis:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+
+  # ----------------------------------------------------------
+  # MONITORING
+  # ----------------------------------------------------------
+
+  prometheus:
+    image: prom/prometheus:latest
+    <<: *service-defaults
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    ports:
+      - "9090:9090"
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.retention.time=15d"
+
+  grafana:
+    image: grafana/grafana:latest
+    <<: *service-defaults
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-grafana_pass}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./monitoring/grafana/dashboards:/etc/grafana/provisioning/dashboards:ro
+    ports:
+      - "3000:3000"
+    depends_on:
+      - prometheus
+
+# ----------------------------------------------------------
+# VOLUMES & NETWORKS
+# ----------------------------------------------------------
+
+volumes:
+  postgres_auth_data:
+  postgres_assessment_data:
+  postgres_ai_data:
+  redis_data:
+  rabbitmq_data:
+  prometheus_data:
+  grafana_data:
+
+networks:
+  backend:
+    driver: bridge
